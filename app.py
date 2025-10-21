@@ -27,19 +27,19 @@ async def add_client_to_room(room_id: str, websocket: WebSocket) -> bool:
         if room_id not in rooms:
             rooms[room_id] = []
         
-        if len(rooms[room_id]) >= 2:
+        if len(rooms[room_id]) >= 4:
             log_event(f"Room {room_id} is full")
             return False
         
         rooms[room_id].append(websocket)
-        log_event(f"✅ Client added to room {room_id} ({len(rooms[room_id])}/2)")
+        log_event(f"✅ Client added to room {room_id} ({len(rooms[room_id])}/4)")
         return True
 
 async def remove_client_from_room(room_id: str, websocket: WebSocket):
     async with room_lock:
         if room_id in rooms and websocket in rooms[room_id]:
             rooms[room_id].remove(websocket)
-            log_event(f"❌ Client removed from room {room_id} ({len(rooms[room_id])}/2 remaining)")
+            log_event(f"❌ Client removed from room {room_id} ({len(rooms[room_id])}/4 remaining)")
             if len(rooms[room_id]) == 0:
                 del rooms[room_id]
                 log_event(f"🧹 Room {room_id} cleaned up")
@@ -79,7 +79,7 @@ async def root():
     if rooms:
         room_info = "<h3>Active Rooms:</h3><ul>"
         for room_id, clients in rooms.items():
-            room_info += f"<li>Room <code>{room_id}</code>: {len(clients)}/2 players</li>"
+            room_info += f"<li>Room <code>{room_id}</code>: {len(clients)}/4 players</li>"
         room_info += "</ul>"
     else:
         room_info = "<p><em>No active rooms</em></p>"
