@@ -10,6 +10,9 @@ import os
 
 # Room management
 rooms: Dict[str, List[WebSocket]] = {}
+# Track assigned peer IDs for each room
+room_peer_ids: Dict[str, List[int]] = {}
+next_peer_id: Dict[str, int] = {}  # Track the next available peer ID for each room
 room_lock = asyncio.Lock()
 server_start_time = datetime.now()
 connection_log: List[str] = []
@@ -26,35 +29,102 @@ async def add_client_to_room(room_id: str, websocket: WebSocket) -> bool:
     async with room_lock:
         if room_id not in rooms:
             rooms[room_id] = []
+            room_peer_ids[room_id] = []
+            next_peer_id[room_id] = 1  # Start with ID 1 (host) and increment
         
         if len(rooms[room_id]) >= 4:
             log_event(f"Room {room_id} is full")
             return False
         
+        # Assign a unique peer ID
+        assigned_id = next_peer_id[room_id]
+        room_peer_ids[room_id].append(assigned_id)
+        next_peer_id[room_id] += 1
+        
         rooms[room_id].append(websocket)
-        log_event(f"✅ Client added to room {room_id} ({len(rooms[room_id])}/4)")
+        log_event(f"✅ Client added to room {room_id} as peer ID {assigned_id} ({len(rooms[room_id])}/4)")
         return True
 
 async def remove_client_from_room(room_id: str, websocket: WebSocket):
     async with room_lock:
         if room_id in rooms and websocket in rooms[room_id]:
+            # Find the websocket index to remove the corresponding peer ID
+            client_index = rooms[room_id].index(websocket)
             rooms[room_id].remove(websocket)
-            log_event(f"❌ Client removed from room {room_id} ({len(rooms[room_id])}/4 remaining)")
+            
+            # Remove the corresponding peer ID
+            if room_id in room_peer_ids and client_index < len(room_peer_ids[room_id]):
+                removed_peer_id = room_peer_ids[room_id][client_index]
+                del room_peer_ids[room_id][client_index]
+                log_event(f"❌ Client (Peer ID {removed_peer_id}) removed from room {room_id} ({len(rooms[room_id])}/4 remaining)")
+            else:
+                log_event(f"❌ Client removed from room {room_id} ({len(rooms[room_id])}/4 remaining)")
+            
             if len(rooms[room_id]) == 0:
-                del rooms[room_id]
+                if room_id in rooms:
+                    del rooms[room_id]
+                if room_id in room_peer_ids:
+                    del room_peer_ids[room_id]
+                if room_id in next_peer_id:
+                    del next_peer_id[room_id]
                 log_event(f"🧹 Room {room_id} cleaned up")
 
 async def relay_message(room_id: str, message: str, sender: WebSocket):
     async with room_lock:
         if room_id in rooms:
+            # Parse the message to check if it's a special request
+            try:
+                msg_data = json.loads(message)
+                msg_type = msg_data.get("type")
+                
+                # Handle special message types
+                if msg_type == "get_peers":
+                    # Send back the list of connected peer IDs
+                    if room_id in room_peer_ids:
+                        peer_list = room_peer_ids[room_id][:]
+                        peer_msg = {
+                            "type": "peer_list",
+                            "peers": peer_list
+                        }
+                        try:
+                            await sender.send_text(json.dumps(peer_msg))
+                            log_event(f"📤 Sent peer list {peer_list} to client in room {room_id}")
+                        except Exception as e:
+                            log_event(f"⚠️ Error sending peer list: {e}")
+                    return
+                elif msg_type == "new_peer_joined":
+                    # Broadcast new peer announcement to all in room except sender
+                    await broadcast_to_room(room_id, message, sender)
+                    # Also send updated peer list to all clients
+                    if room_id in room_peer_ids:
+                        peer_list = room_peer_ids[room_id][:]
+                        peer_msg = {
+                            "type": "peer_list",
+                            "peers": peer_list
+                        }
+                        await broadcast_to_room(room_id, json.dumps(peer_msg), sender)
+                        log_event(f"📢 Sent updated peer list to all peers in room {room_id}")
+                    return
+                else:
+                    # For regular messages, broadcast to all other clients
+                    await broadcast_to_room(room_id, message, sender)
+                    log_event(f"📤 Relayed {msg_data.get('type', 'msg')} in room {room_id}")
+            except json.JSONDecodeError:
+                # If not JSON, treat as regular message and broadcast to all others
+                await broadcast_to_room(room_id, message, sender)
+                log_event(f"📤 Relayed message in room {room_id}")
+
+
+async def broadcast_to_room(room_id: str, message: str, exclude_client: WebSocket = None):
+    """Broadcast a message to all clients in the room."""
+    async with room_lock:
+        if room_id in rooms:
             for client in rooms[room_id]:
-                if client != sender:
+                if exclude_client is None or client != exclude_client:
                     try:
                         await client.send_text(message)
-                        msg_data = json.loads(message)
-                        log_event(f"📤 Relayed {msg_data.get('type', 'msg')} in room {room_id}")
                     except Exception as e:
-                        log_event(f"⚠️ Relay error: {e}")
+                        log_event(f"⚠️ Broadcast error: {e}")
 
 # Create FastAPI app
 app = FastAPI()
