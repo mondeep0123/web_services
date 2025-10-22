@@ -196,10 +196,17 @@ async def relay_message(room_id: str, message: str, sender: WebSocket):
                         if sender_peer_id and isinstance(msg_data, dict):
                             msg_data["from_peer_id"] = sender_peer_id
                         
-                        await broadcast_to_room(room_id, json.dumps(msg_data), sender)
-                        # Only log if it's not an ICE candidate (too verbose)
-                        if "candidate" not in msg_data and "name" not in msg_data:
-                            log_event(f"📤 Relayed {msg_type} from peer {sender_peer_id} in room {room_id}")
+                        # Check for a 'to_peer_id' to enable direct messaging
+                        to_peer_id = msg_data.get("to_peer_id")
+                        if to_peer_id:
+                            await send_to_peer(room_id, to_peer_id, json.dumps(msg_data))
+                            log_event(f"🎯 Relayed message from {sender_peer_id} to {to_peer_id} in room {room_id}")
+                        else:
+                            # Fallback to broadcast if no specific recipient
+                            await broadcast_to_room(room_id, json.dumps(msg_data), sender)
+                            if "candidate" not in msg_data and "name" not in msg_data:
+                                log_event(f"📤 Relayed {msg_type} from peer {sender_peer_id} in room {room_id}")
+>>>>>>> Stashed changes
                 
                 except json.JSONDecodeError:
                     # If not JSON, treat as regular message and broadcast to all others
@@ -222,6 +229,22 @@ async def broadcast_to_room(room_id: str, message: str, exclude_client: WebSocke
                             log_event(f"⚠️ Broadcast error: {e}")
     except Exception as e:
         log_event(f"❌ Error in broadcast_to_room: {e}")
+
+async def send_to_peer(room_id: str, peer_id: int, message: str):
+    """Send a message to a specific peer in a room."""
+    try:
+        async with room_lock:
+            if room_id in rooms and room_id in room_peer_ids:
+                if peer_id in room_peer_ids[room_id]:
+                    peer_index = room_peer_ids[room_id].index(peer_id)
+                    if peer_index < len(rooms[room_id]):
+                        recipient_ws = rooms[room_id][peer_index]
+                        try:
+                            await recipient_ws.send_text(message)
+                        except Exception as e:
+                            log_event(f"⚠️ Error sending to peer {peer_id}: {e}")
+    except Exception as e:
+        log_event(f"❌ Error in send_to_peer: {e}")
 
 async def check_connection_health():
     """Periodically check connection health and cleanup dead connections."""
