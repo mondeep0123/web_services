@@ -206,7 +206,7 @@ async def relay_message(room_id: str, message: str, sender: WebSocket):
                             await broadcast_to_room(room_id, json.dumps(msg_data), sender)
                             if "candidate" not in msg_data and "name" not in msg_data:
                                 log_event(f"📤 Relayed {msg_type} from peer {sender_peer_id} in room {room_id}")
-                                
+                
                 except json.JSONDecodeError:
                     # If not JSON, treat as regular message and broadcast to all others
                     await broadcast_to_room(room_id, message, sender)
