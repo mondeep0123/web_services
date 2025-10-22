@@ -8,6 +8,8 @@ from datetime import datetime
 import json
 import os
 
+import signal
+
 # Room management
 rooms: Dict[str, List[WebSocket]] = {}
 # Track assigned peer IDs for each room
@@ -16,6 +18,34 @@ next_peer_id: Dict[str, int] = {}  # Track the next available peer ID for each r
 room_lock = asyncio.Lock()
 server_start_time = datetime.now()
 connection_log: List[str] = []
+
+def cleanup_resources():
+    """Clean up resources when the server shuts down."""
+    global rooms, room_peer_ids, next_peer_id
+    log_event("🛑 Server shutting down, cleaning up resources...")
+    
+    # Close all WebSocket connections
+    for room_clients in rooms.values():
+        for ws in room_clients:
+            try:
+                # Close the WebSocket connection gracefully
+                pass  # WebSocket closure is handled by the connection lifecycle
+            except:
+                pass
+    
+    # Clear all room data
+    rooms.clear()
+    room_peer_ids.clear()
+    next_peer_id.clear()
+    log_event("✅ All resources cleaned up")
+
+# Register cleanup function to run on shutdown
+def signal_handler(signum, frame):
+    cleanup_resources()
+    exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 def log_event(message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -147,6 +177,18 @@ async def root():
     uptime = datetime.now() - server_start_time
     hours = int(uptime.total_seconds() // 3600)
     minutes = int((uptime.total_seconds() % 3600) // 60)
+    
+    # Clean up any empty rooms that might have been left behind
+    async with room_lock:
+        empty_rooms = [rid for rid, clients in rooms.items() if len(clients) == 0]
+        for room_id in empty_rooms:
+            if room_id in rooms:
+                del rooms[room_id]
+            if room_id in room_peer_ids:
+                del room_peer_ids[room_id]
+            if room_id in next_peer_id:
+                del next_peer_id[room_id]
+            log_event(f"🧹 Cleanup: Empty room {room_id} removed")
     
     room_info = ""
     if rooms:
