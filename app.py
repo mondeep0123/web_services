@@ -139,9 +139,11 @@ async def relay_message(room_id: str, message: str, sender: WebSocket):
                         log_event(f"📢 Sent updated peer list to all peers in room {room_id}")
                     return
                 else:
-                    # For regular messages, broadcast to all other clients
+                    # For regular messages (including WebRTC SDP offers/answers and ICE candidates), broadcast to all other clients
                     await broadcast_to_room(room_id, message, sender)
-                    log_event(f"📤 Relayed {msg_data.get('type', 'msg')} in room {room_id}")
+                    # Only log if it's not an ICE candidate (too verbose)
+                    if "candidate" not in msg_data and "name" not in msg_data:
+                        log_event(f"📤 Relayed {msg_data.get('type', 'msg')} in room {room_id}")
             except json.JSONDecodeError:
                 # If not JSON, treat as regular message and broadcast to all others
                 await broadcast_to_room(room_id, message, sender)
