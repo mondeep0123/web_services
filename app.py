@@ -477,8 +477,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
         return
     
     # Add client to room and get peer ID
-    assigned_id = await add_client_to_room(room_id, websocket)
-    if assigned_id is None:
+    if not await add_client_to_room(room_id, websocket):
         try:
             await websocket.send_text(json.dumps({
                 "type": "error",
@@ -489,6 +488,24 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
         except:
             pass
         return
+    
+    # Find the assigned peer ID for this websocket
+    assigned_id = None
+    if room_id in room_peer_ids:
+        try:
+            client_index = rooms[room_id].index(websocket)
+            if client_index < len(room_peer_ids[room_id]):
+                assigned_id = room_peer_ids[room_id][client_index]
+        except (ValueError, IndexError):
+            log_event(f"❌ Could not find assigned peer ID for websocket in room {room_id}")
+            return
+    
+    if assigned_id is None:
+        log_event(f"❌ Could not determine assigned peer ID for websocket in room {room_id}")
+        return
+    
+    # Update peer connection state to connected
+    await update_peer_state(room_id, assigned_id, PEER_STATE_CONNECTED)
     
     # Send welcome message with assigned peer ID
     try:
