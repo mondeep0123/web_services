@@ -442,11 +442,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
     log_event(f"🔌 Connection attempt for room: {room_id}")
     
     try:
-        # Accept with more compatible headers
-        await websocket.accept(headers={
-            "Sec-WebSocket-Protocol": "chat, superchat",
-            "Sec-WebSocket-Extensions": "permessage-deflate"
-        })
+        # Accept WebSocket connection
+        await websocket.accept()
         log_event(f"✅ WebSocket accepted for room: {room_id}")
     except Exception as e:
         log_event(f"❌ Error accepting WebSocket: {e}")
