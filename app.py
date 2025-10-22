@@ -192,18 +192,23 @@ async def relay_message(room_id: str, message: str, sender: WebSocket):
                     
                     # For regular messages (WebRTC SDP offers/answers and ICE candidates)
                     else:
-                        # Add sender peer ID to message for tracking
-                        if sender_peer_id and isinstance(msg_data, dict):
-                            msg_data["from_peer_id"] = sender_peer_id
+                        # Add sender peer ID to the outer message for tracking
+                        original_message = json.loads(message)
+                        if sender_peer_id:
+                            original_message["from_peer_id"] = sender_peer_id
                         
-                        # Check for a 'to_peer_id' to enable direct messaging
-                        to_peer_id = msg_data.get("to_peer_id")
+                        # Check for a 'to_peer_id' at the root level to enable direct messaging
+                        to_peer_id = original_message.get("to_peer_id")
                         if to_peer_id:
-                            await send_to_peer(room_id, to_peer_id, json.dumps(msg_data))
+                            await send_to_peer(room_id, to_peer_id, json.dumps(original_message))
                             log_event(f"🎯 Relayed message from {sender_peer_id} to {to_peer_id} in room {room_id}")
                         else:
+                            # Process the inner data and add sender info
+                            if isinstance(msg_data, dict):
+                                msg_data["from_peer_id"] = sender_peer_id
+                            
                             # Fallback to broadcast if no specific recipient
-                            await broadcast_to_room(room_id, json.dumps(msg_data), sender)
+                            await broadcast_to_room(room_id, json.dumps(original_message), sender)
                             if "candidate" not in msg_data and "name" not in msg_data:
                                 log_event(f"📤 Relayed {msg_type} from peer {sender_peer_id} in room {room_id}")
                 
