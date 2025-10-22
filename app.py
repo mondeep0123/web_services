@@ -1,34 +1,19 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import asyncio
-from typing import Dict, List, Optional
+from typing import Dict, List
 from datetime import datetime
 import json
 import os
-import uuid
 
-# Room management
+# Simple signaling server - star topology with host relay
 rooms: Dict[str, List[WebSocket]] = {}
-# Track assigned peer IDs for each room
 room_peer_ids: Dict[str, List[int]] = {}
-# Track peer connection states
-room_peer_states: Dict[str, Dict[int, str]] = {}  # peer_id -> state
-room_peer_last_heartbeat: Dict[str, Dict[int, datetime]] = {}
-next_peer_id: Dict[str, int] = {}  # Track the next available peer ID for each room
+next_peer_id: Dict[str, int] = {}
 room_lock = asyncio.Lock()
-
-# Game state management for server-relayed architecture
-game_states: Dict[str, Dict] = {}  # room_id -> game state
-game_states_lock = asyncio.Lock()
 server_start_time = datetime.now()
 connection_log: List[str] = []
-
-# Connection states
-PEER_STATE_CONNECTING = "connecting"
-PEER_STATE_CONNECTED = "connected"
-PEER_STATE_DISCONNECTED = "disconnected"
 
 def log_event(message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -38,310 +23,85 @@ def log_event(message: str):
     if len(connection_log) > 50:
         connection_log.pop(0)
 
-async def add_client_to_room(room_id: str, websocket: WebSocket) -> Optional[int]:
-    """Add a client to a room and return assigned peer ID. Returns None if failed."""
-    try:
-        async with room_lock:
-            if room_id not in rooms:
-                rooms[room_id] = []
-                room_peer_ids[room_id] = []
-                room_peer_states[room_id] = {}
-                room_peer_last_heartbeat[room_id] = {}
-                next_peer_id[room_id] = 1  # Start with ID 1 (host) and increment
-            
-            current_count = len(rooms[room_id])
-            log_event(f"DEBUG: Attempting to add client to room {room_id}, current count: {current_count}/4")
-            
-            if current_count >= 4:
-                log_event(f"Room {room_id} is full - has {current_count} clients")
-                return None
-            
-            # Assign a unique peer ID with room prefix
-            assigned_id = next_peer_id[room_id]
-            room_peer_ids[room_id].append(assigned_id)
-            room_peer_states[room_id][assigned_id] = PEER_STATE_CONNECTING
-            room_peer_last_heartbeat[room_id][assigned_id] = datetime.now()
-            next_peer_id[room_id] += 1
-            
-            rooms[room_id].append(websocket)
-            new_count = len(rooms[room_id])
-            log_event(f"✅ Client added to room {room_id} as peer ID {assigned_id} ({new_count}/4)")
-            return assigned_id
-    except Exception as e:
-        log_event(f"❌ Error adding client to room {room_id}: {e}")
-        return None
+async def add_client_to_room(room_id: str, websocket: WebSocket) -> int:
+    """Add client to room and return peer ID (1 for host, 2+ for clients)."""
+    async with room_lock:
+        if room_id not in rooms:
+            rooms[room_id] = []
+            room_peer_ids[room_id] = []
+            next_peer_id[room_id] = 1
+        
+        if len(rooms[room_id]) >= 4:
+            log_event(f"Room {room_id} is full ({len(rooms[room_id])}/4)")
+            return None
+        
+        peer_id = next_peer_id[room_id]
+        next_peer_id[room_id] += 1
+        
+        rooms[room_id].append(websocket)
+        room_peer_ids[room_id].append(peer_id)
+        
+        log_event(f"✅ Peer {peer_id} joined room {room_id} ({len(rooms[room_id])}/4)")
+        return peer_id
 
 async def remove_client_from_room(room_id: str, websocket: WebSocket):
-    """Remove a client from a room and notify others."""
-    try:
-        async with room_lock:
-            if room_id in rooms and websocket in rooms[room_id]:
-                # Find the index of the websocket to remove the corresponding peer ID
-                client_index = rooms[room_id].index(websocket)
-                rooms[room_id].pop(client_index)
-                
-                # Remove the corresponding peer ID at the same index
-                removed_peer_id = None
-                if room_id in room_peer_ids and client_index < len(room_peer_ids[room_id]):
-                    removed_peer_id = room_peer_ids[room_id].pop(client_index)
-                
-                # Remove from states and heartbeat tracking
-                if removed_peer_id is not None and room_id in room_peer_states:
-                    room_peer_states[room_id].pop(removed_peer_id, None)
-                    room_peer_last_heartbeat[room_id].pop(removed_peer_id, None)
-                
-                if removed_peer_id is not None:
-                    log_event(f"❌ Client (Peer ID {removed_peer_id}) removed from room {room_id} ({len(rooms[room_id])}/4 remaining)")
-                    
-                    # Remove player from game state if present
-                    if removed_peer_id and room_id in game_states:
-                        if "players" in game_states[room_id] and removed_peer_id in game_states[room_id]["players"]:
-                            del game_states[room_id]["players"][removed_peer_id]
-                            log_event(f"🗑️ Removed player {removed_peer_id} from game state in room {room_id}")
-                    
-                    # Notify other peers about the disconnection
-                    await notify_peer_disconnection(room_id, removed_peer_id)
-                else:
-                    log_event(f"❌ Client removed from room {room_id} ({len(rooms[room_id])}/4 remaining)")
-                
-                # Check if room is now empty and cleanup if needed
-                if room_id in rooms and len(rooms[room_id]) == 0:
-                    if room_id in rooms:
-                        del rooms[room_id]
-                    if room_id in room_peer_ids:
-                        del room_peer_ids[room_id]
-                    if room_id in room_peer_states:
-                        del room_peer_states[room_id]
-                    if room_id in room_peer_last_heartbeat:
-                        del room_peer_last_heartbeat[room_id]
-                    if room_id in next_peer_id:
-                        del next_peer_id[room_id]
-                    # Clean up game state for empty room
-                    if room_id in game_states:
-                        del game_states[room_id]
-                    log_event(f"🧹 Room {room_id} cleaned up")
-    except Exception as e:
-        log_event(f"❌ Error removing client from room {room_id}: {e}")
-
-async def notify_peer_disconnection(room_id: str, peer_id: int):
-    """Notify all peers in room about a peer disconnection."""
-    try:
-        notification = {
-            "type": "peer_disconnected",
-            "peer_id": peer_id,
-            "timestamp": datetime.now().isoformat()
-        }
-        await broadcast_to_room(room_id, json.dumps(notification))
-        log_event(f"📢 Notified room {room_id} about peer {peer_id} disconnection")
-    except Exception as e:
-        log_event(f"❌ Error notifying peer disconnection: {e}")
-
-async def update_peer_state(room_id: str, peer_id: int, state: str):
-    """Update the state of a peer."""
+    """Remove client from room."""
     async with room_lock:
-        if room_id in room_peer_states and peer_id in room_peer_states[room_id]:
-            room_peer_states[room_id][peer_id] = state
-            room_peer_last_heartbeat[room_id][peer_id] = datetime.now()
-            log_event(f"📊 Peer {peer_id} in room {room_id} state changed to {state}")
+        if room_id in rooms and websocket in rooms[room_id]:
+            idx = rooms[room_id].index(websocket)
+            rooms[room_id].pop(idx)
+            peer_id = room_peer_ids[room_id].pop(idx)
+            
+            log_event(f"❌ Peer {peer_id} left room {room_id} ({len(rooms[room_id])}/4)")
+            
+            # Notify others
+            if rooms[room_id]:
+                msg = json.dumps({"type": "peer_disconnected", "peer_id": peer_id})
+                for client in rooms[room_id]:
+                    try:
+                        await client.send_text(msg)
+                    except:
+                        pass
+            
+            # Cleanup empty room
+            if not rooms[room_id]:
+                del rooms[room_id]
+                del room_peer_ids[room_id]
+                del next_peer_id[room_id]
+                log_event(f"🧹 Room {room_id} deleted")
 
 async def relay_message(room_id: str, message: str, sender: WebSocket):
-    """Relay messages between peers with enhanced handling."""
-    try:
-        async with room_lock:
-            if room_id in rooms:
+    """Relay signaling messages between peers."""
+    async with room_lock:
+        if room_id in rooms:
+            try:
+                data = json.loads(message)
+                msg_type = data.get("type", "")
+                
                 # Find sender's peer ID
-                sender_peer_id = None
-                if room_id in room_peer_ids:
-                    sender_index = rooms[room_id].index(sender)
-                    if sender_index < len(room_peer_ids[room_id]):
-                        sender_peer_id = room_peer_ids[room_id][sender_index]
+                sender_id = None
+                if sender in rooms[room_id]:
+                    idx = rooms[room_id].index(sender)
+                    sender_id = room_peer_ids[room_id][idx]
                 
-                # Parse the message to check if it's a special request
-                try:
-                    msg_data = json.loads(message)
-                    msg_type = msg_data.get("type")
-                    
-                    # Handle heartbeat messages
-                    if msg_type == "heartbeat":
-                        if sender_peer_id:
-                            await update_peer_state(room_id, sender_peer_id, PEER_STATE_CONNECTED)
-                        return
-                    
-                    # Handle special message types
-                    elif msg_type == "get_peers":
-                        # Send back the list of connected peer IDs and their states
-                        if room_id in room_peer_ids:
-                            peer_list = []
-                            for i, peer_id in enumerate(room_peer_ids[room_id]):
-                                peer_list.append({
-                                    "id": peer_id,
-                                    "state": room_peer_states[room_id].get(peer_id, "unknown")
-                                })
-                            peer_msg = {
-                                "type": "peer_list",
-                                "peers": peer_list,
-                                "timestamp": datetime.now().isoformat()
-                            }
-                            try:
-                                await sender.send_text(json.dumps(peer_msg))
-                                log_event(f"📤 Sent peer list to peer {sender_peer_id} in room {room_id}")
-                            except Exception as e:
-                                log_event(f"⚠️ Error sending peer list: {e}")
-                        return
-                    
-                    elif msg_type == "new_peer_joined":
-                        # Broadcast new peer announcement and updated peer list in one message
-                        if room_id in room_peer_ids:
-                            peer_list = []
-                            for i, peer_id in enumerate(room_peer_ids[room_id]):
-                                peer_list.append({
-                                    "id": peer_id,
-                                    "state": room_peer_states[room_id].get(peer_id, "unknown")
-                                })
-                            response = {
-                                "type": "peer_update",
-                                "announcement": msg_data,
-                                "peers": peer_list,
-                                "timestamp": datetime.now().isoformat()
-                            }
-                            await broadcast_to_room(room_id, json.dumps(response), sender)
-                            log_event(f"📢 Sent peer update to all peers in room {room_id}")
-                        return
-                    
-                    # For regular messages (WebRTC SDP offers/answers and ICE candidates)
-                    else:
-                        # Add sender peer ID to the outer message for tracking
-                        original_message = json.loads(message)
-                        if sender_peer_id:
-                            original_message["from_peer_id"] = sender_peer_id
-                        
-                        # For server-relayed architecture, broadcast all game messages to all players
-                        # WebRTC signaling messages (offers, answers, ICE candidates) get special handling
-                        msg_subtype = msg_data.get("type", "")
-                        
-                        if msg_subtype in ["offer", "answer", "candidate"]:
-                            # WebRTC signaling - broadcast to all in room for connection establishment
-                            await broadcast_to_room(room_id, json.dumps(original_message), sender)
-                            if "candidate" not in msg_data and "name" not in msg_data:
-                                log_event(f"🔄 Relayed WebRTC {msg_subtype} from peer {sender_peer_id} in room {room_id}")
-                        else:
-                            # Game state messages - broadcast to all other players in room
-                            await broadcast_to_room(room_id, json.dumps(original_message), sender)
-                            log_event(f"🎮 Relayed game message from peer {sender_peer_id} in room {room_id}")
+                # Add sender info
+                data["from_peer_id"] = sender_id
+                message_with_sender = json.dumps(data)
                 
-                except json.JSONDecodeError:
-                    # If not JSON, treat as regular message and broadcast to all others
-                    await broadcast_to_room(room_id, message, sender)
-                    log_event(f"📤 Relayed message from peer {sender_peer_id} in room {room_id}")
-    
-    except Exception as e:
-        log_event(f"❌ Error in relay_message: {e}")
-
-async def broadcast_to_room(room_id: str, message: str, exclude_client: WebSocket = None):
-    """Broadcast a message to all clients in the room."""
-    try:
-        async with room_lock:
-            if room_id in rooms:
+                # Relay to all others (for signaling)
                 for client in rooms[room_id]:
-                    if exclude_client is None or client != exclude_client:
+                    if client != sender:
                         try:
-                            await client.send_text(message)
-                        except Exception as e:
-                            log_event(f"⚠️ Broadcast error: {e}")
-    except Exception as e:
-        log_event(f"❌ Error in broadcast_to_room: {e}")
+                            await client.send_text(message_with_sender)
+                        except:
+                            pass
+                            
+            except:
+                pass
 
-async def update_game_state_and_broadcast(room_id: str, sender_peer_id: int, message: dict):
-    """Update game state and broadcast to all players in room."""
-    try:
-        async with game_states_lock:
-            # Initialize game state for room if needed
-            if room_id not in game_states:
-                game_states[room_id] = {
-                    "players": {},
-                    "last_update": datetime.now().isoformat()
-                }
-            
-            # Update player-specific game data
-            if "player_state" in message:
-                player_data = message["player_state"]
-                game_states[room_id]["players"][sender_peer_id] = {
-                    "position": player_data.get("position", [0, 0, 0]),
-                    "rotation": player_data.get("rotation", [0, 0, 0]),
-                    "velocity": player_data.get("velocity", [0, 0, 0]),
-                    "last_update": datetime.now().isoformat()
-                }
-            
-            # Broadcast updated game state
-            game_update = {
-                "type": "game_state_update",
-                "room_id": room_id,
-                "game_state": game_states[room_id],
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            # Broadcast to all players in room
-            await broadcast_to_room(room_id, json.dumps(game_update))
-            
-    except Exception as e:
-        log_event(f"❌ Error updating game state: {e}")
-
-async def send_to_peer(room_id: str, peer_id: int, message: str):
-    """Send a message to a specific peer in a room."""
-    try:
-        async with room_lock:
-            if room_id in rooms and room_id in room_peer_ids:
-                if peer_id in room_peer_ids[room_id]:
-                    peer_index = room_peer_ids[room_id].index(peer_id)
-                    if peer_index < len(rooms[room_id]):
-                        recipient_ws = rooms[room_id][peer_index]
-                        try:
-                            await recipient_ws.send_text(message)
-                        except Exception as e:
-                            log_event(f"⚠️ Error sending to peer {peer_id}: {e}")
-    except Exception as e:
-        log_event(f"❌ Error in send_to_peer: {e}")
-
-async def check_connection_health():
-    """Periodically check connection health and cleanup dead connections."""
-    while True:
-        await asyncio.sleep(30)  # Check every 30 seconds
-        
-        try:
-            async with room_lock:
-                current_time = datetime.now()
-                room_ids = list(rooms.keys())
-                
-                for room_id in room_ids:
-                    if room_id in room_peer_last_heartbeat:
-                        dead_peers = []
-                        for peer_id, last_heartbeat in room_peer_last_heartbeat[room_id].items():
-                            # If no heartbeat for 60 seconds, consider peer dead
-                            if (current_time - last_heartbeat).total_seconds() > 60:
-                                dead_peers.append(peer_id)
-                        
-                        # Remove dead peers
-                        for peer_id in dead_peers:
-                            log_event(f"💀 Peer {peer_id} in room {room_id} appears dead, removing...")
-                            # Find and remove the corresponding websocket
-                            if room_id in room_peer_ids and peer_id in room_peer_ids[room_id]:
-                                peer_index = room_peer_ids[room_id].index(peer_id)
-                                if peer_index < len(rooms[room_id]):
-                                    dead_websocket = rooms[room_id][peer_index]
-                                    try:
-                                        await dead_websocket.close()
-                                    except:
-                                        pass
-                                    # Trigger cleanup
-                                    await remove_client_from_room(room_id, dead_websocket)
-        
-        except Exception as e:
-            log_event(f"⚠️ Error in health check: {e}")
-
-# Create FastAPI app
+# FastAPI app
 app = FastAPI()
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -350,54 +110,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup_event():
-    """Start background tasks when the app starts."""
-    # Start the health check task
-    asyncio.create_task(check_connection_health())
-    log_event("🏥 Health check task started")
-
 @app.get("/")
 async def root():
-    """Home page with server info."""
     uptime = datetime.now() - server_start_time
     hours = int(uptime.total_seconds() // 3600)
     minutes = int((uptime.total_seconds() % 3600) // 60)
-    
-    # Clean up any empty rooms that might have been left behind
-    try:
-        async with room_lock:
-            room_ids = list(rooms.keys())
-            for room_id in room_ids:
-                if room_id in rooms and len(rooms[room_id]) == 0:
-                    if room_id in rooms:
-                        del rooms[room_id]
-                    if room_id in room_peer_ids:
-                        del room_peer_ids[room_id]
-                    if room_id in room_peer_states:
-                        del room_peer_states[room_id]
-                    if room_id in room_peer_last_heartbeat:
-                        del room_peer_last_heartbeat[room_id]
-                    if room_id in next_peer_id:
-                        del next_peer_id[room_id]
-                    log_event(f"🧹 Cleanup: Empty room {room_id} removed")
-    except Exception as e:
-        log_event(f"⚠️ Error during room cleanup: {e}")
     
     room_info = ""
     if rooms:
         room_info = "<h3>Active Rooms:</h3><ul>"
         for room_id, clients in rooms.items():
-            room_info += f"<li>Room <code>{room_id}</code>: {len(clients)}/4 players"
-            if room_id in room_peer_states:
-                connected_count = sum(1 for state in room_peer_states[room_id].values() if state == PEER_STATE_CONNECTED)
-                room_info += f" ({connected_count} connected)"
-            # Show game state if available
-            if room_id in game_states:
-                game_state = game_states[room_id]
-                player_count = len(game_state.get("players", {}))
-                room_info += f" | Game: {player_count} players active"
-            room_info += "</li>"
+            room_info += f"<li>Room <code>{room_id}</code>: {len(clients)}/4 players</li>"
         room_info += "</ul>"
     else:
         room_info = "<p><em>No active rooms</em></p>"
@@ -407,199 +130,84 @@ async def root():
         log_info += f"<li><code>{log}</code></li>"
     log_info += "</ul>"
     
-    html_content = f"""
+    html = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>WebRTC Signaling Server</title>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>WebRTC Signaling Server (Star Topology)</title>
         <style>
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                max-width: 900px;
-                margin: 0 auto;
-                padding: 20px;
-                background: #0f172a;
-                color: #e2e8f0;
-            }}
+            body {{ font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #0f172a; color: #e2e8f0; }}
             h1 {{ color: #60a5fa; }}
-            h2 {{ color: #34d399; margin-top: 30px; }}
-            h3 {{ color: #a78bfa; }}
-            code {{
-                background: #1e293b;
-                padding: 2px 6px;
-                border-radius: 4px;
-                color: #fbbf24;
-            }}
-            pre {{
-                background: #1e293b;
-                padding: 15px;
-                border-radius: 8px;
-                overflow-x: auto;
-                border-left: 4px solid #60a5fa;
-            }}
-            .status {{
-                display: inline-block;
-                padding: 8px 16px;
-                background: #065f46;
-                border-radius: 20px;
-                color: #d1fae5;
-                margin: 10px 0;
-            }}
-            ul {{
-                background: #1e293b;
-                padding: 15px 30px;
-                border-radius: 8px;
-            }}
-            li {{ margin: 8px 0; }}
-            .endpoint {{
-                background: #1e293b;
-                padding: 15px;
-                border-radius: 8px;
-                border-left: 4px solid #34d399;
-                margin: 15px 0;
-            }}
-            .health-indicator {{
-                display: inline-block;
-                width: 10px;
-                height: 10px;
-                background: #34d399;
-                border-radius: 50%;
-                margin-right: 8px;
-            }}
+            code {{ background: #1e293b; padding: 2px 6px; border-radius: 4px; color: #fbbf24; }}
+            .status {{ display: inline-block; padding: 8px 16px; background: #065f46; border-radius: 20px; color: #d1fae5; margin: 10px 0; }}
+            ul {{ background: #1e293b; padding: 15px 30px; border-radius: 8px; }}
         </style>
-        <script>
-            // Auto-refresh every 3 seconds
-            setTimeout(() => location.reload(), 3000);
-        </script>
+        <script>setTimeout(() => location.reload(), 3000);</script>
     </head>
     <body>
         <h1>🎮 WebRTC Signaling Server</h1>
-        <div class="status">🟢 <span class="health-indicator"></span>Server Online | Uptime: {hours}h {minutes}m</div>
-        
-        <h2>📡 Connection Information</h2>
-        <div class="endpoint">
-            <strong>WebSocket Endpoint:</strong><br>
-            <code>wss://web-services-nheh.onrender.com/ws/{{room_id}}/</code>
-        </div>
-        
-        <h2>🔧 Godot Usage</h2>
-        <pre><code>var signaling_url = "wss://web-services-nheh.onrender.com/ws/"
-var room_id = "test123"
-websocket_peer.connect_to_url(signaling_url + room_id + "/")</code></pre>
+        <div class="status">🟢 Server Online | Uptime: {hours}h {minutes}m</div>
         
         <h2>📊 Server Status</h2>
         <p><strong>Active Rooms:</strong> {len(rooms)}</p>
-        <p><strong>Total Connections:</strong> {sum(len(clients) for clients in rooms.values())}</p>
+        <p><strong>Total Connections:</strong> {sum(len(c) for c in rooms.values())}</p>
         {room_info}
-        
         {log_info}
         
-        <h3>🏥 Health Monitoring</h3>
-        <p><em>• Connection health checks every 30 seconds</em></p>
-        <p><em>• Dead connections automatically cleaned up after 60 seconds</em></p>
-        <p><em>• Peer state tracking and disconnection notifications</em></p>
-        
-        <p style="margin-top: 30px; color: #64748b; font-size: 0.9em;">
-            <em>Page auto-refreshes every 3 seconds</em>
-        </p>
+        <h2>ℹ️ Architecture</h2>
+        <p><strong>Star Topology:</strong> Host (peer 1) relays all game data. Server only handles WebRTC signaling.</p>
+        <p><strong>WebSocket URL:</strong> <code>wss://web-services-nheh.onrender.com/ws/{{room_id}}/</code></p>
     </body>
     </html>
     """
-    return HTMLResponse(content=html_content)
+    return HTMLResponse(content=html)
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint for Render."""
-    total_players = sum(len(clients) for clients in rooms.values())
-    
-    # Count connected players
-    connected_players = 0
-    for room_id in rooms:
-        if room_id in room_peer_states:
-            connected_players += sum(1 for state in room_peer_states[room_id].values() if state == PEER_STATE_CONNECTED)
-    
-    # Count active game players
-    game_players = 0
-    for room_id in game_states:
-        game_players += len(game_states[room_id].get("players", {}))
-    
+async def health():
     return {
         "status": "healthy",
         "uptime_seconds": (datetime.now() - server_start_time).total_seconds(),
         "active_rooms": len(rooms),
-        "total_connections": total_players,
-        "connected_players": connected_players,
-        "game_players": game_players,
-        "timestamp": datetime.now().isoformat()
+        "total_connections": sum(len(c) for c in rooms.values())
     }
 
 @app.websocket("/ws/{room_id}/")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
-    """WebSocket endpoint for signaling with enhanced error handling."""
-    assigned_id = None
+    """WebSocket endpoint for WebRTC signaling only."""
+    peer_id = None
     try:
-        log_event(f"🔌 Connection attempt for room: {room_id}")
-        
-        # Accept WebSocket connection
         await websocket.accept()
-        log_event(f"✅ WebSocket accepted for room: {room_id}")
+        log_event(f"🔌 Connection to room {room_id}")
         
-        # Add client to room and get peer ID
-        log_event(f"🛠️ About to add client to room {room_id}...")
-        assigned_id = await add_client_to_room(room_id, websocket)
-        log_event(f"🆔 Peer ID assigned: {assigned_id if assigned_id else 'NONE'}")
-        if assigned_id is None:
-            try:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": "Room is full",
-                    "code": "ROOM_FULL"
-                }))
-                await websocket.close()
-            except:
-                pass
+        peer_id = await add_client_to_room(room_id, websocket)
+        if peer_id is None:
+            await websocket.send_text(json.dumps({"type": "error", "message": "Room full"}))
+            await websocket.close()
             return
         
-        # Update peer connection state to connected
-        await update_peer_state(room_id, assigned_id, PEER_STATE_CONNECTED)
-        
-        # Send welcome message with assigned peer ID
-        welcome_msg = {
+        # Send welcome with peer ID
+        await websocket.send_text(json.dumps({
             "type": "welcome",
-            "peer_id": assigned_id,
+            "peer_id": peer_id,
             "room_id": room_id,
-            "timestamp": datetime.now().isoformat()
-        }
-        await websocket.send_text(json.dumps(welcome_msg))
-        log_event(f"🎉 Welcome message sent to peer {assigned_id}")
+            "is_host": peer_id == 1
+        }))
+        log_event(f"🎉 Peer {peer_id} welcomed (host={peer_id == 1})")
         
-        # Message loop
+        # Message loop - relay signaling only
         while True:
             message = await websocket.receive_text()
             await relay_message(room_id, message, websocket)
     
     except WebSocketDisconnect:
-        log_event(f"🔌 Client (Peer {assigned_id}) disconnected normally from room: {room_id}")
-        # Notify other players about disconnection
-        if room_id in rooms and assigned_id:
-            disconnect_msg = {
-                "type": "player_disconnected",
-                "peer_id": assigned_id,
-                "room_id": room_id,
-                "timestamp": datetime.now().isoformat()
-            }
-            await broadcast_to_room(room_id, json.dumps(disconnect_msg), websocket)
+        log_event(f"🔌 Peer {peer_id} disconnected")
     except Exception as e:
-        log_event(f"❌ CRITICAL: Error in websocket_endpoint for room {room_id}, peer {assigned_id}: {e}")
-        import traceback
-        log_event(f"Traceback: {traceback.format_exc()}")
+        log_event(f"❌ Error for peer {peer_id}: {e}")
     finally:
-        if assigned_id:
+        if peer_id:
             await remove_client_from_room(room_id, websocket)
 
-log_event("🚀 Server initialized and ready")
+log_event("🚀 Star topology signaling server ready")
 
 if __name__ == "__main__":
     import uvicorn
