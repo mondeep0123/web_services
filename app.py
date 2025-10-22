@@ -45,8 +45,11 @@ async def add_client_to_room(room_id: str, websocket: WebSocket) -> Optional[int
                 room_peer_last_heartbeat[room_id] = {}
                 next_peer_id[room_id] = 1  # Start with ID 1 (host) and increment
             
-            if len(rooms[room_id]) >= 4:
-                log_event(f"Room {room_id} is full")
+            current_count = len(rooms[room_id])
+            log_event(f"DEBUG: Attempting to add client to room {room_id}, current count: {current_count}/4")
+            
+            if current_count >= 4:
+                log_event(f"Room {room_id} is full - has {current_count} clients")
                 return None
             
             # Assign a unique peer ID with room prefix
@@ -57,7 +60,8 @@ async def add_client_to_room(room_id: str, websocket: WebSocket) -> Optional[int
             next_peer_id[room_id] += 1
             
             rooms[room_id].append(websocket)
-            log_event(f"✅ Client added to room {room_id} as peer ID {assigned_id} ({len(rooms[room_id])}/4)")
+            new_count = len(rooms[room_id])
+            log_event(f"✅ Client added to room {room_id} as peer ID {assigned_id} ({new_count}/4)")
             return assigned_id
     except Exception as e:
         log_event(f"❌ Error adding client to room {room_id}: {e}")
@@ -477,7 +481,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
         return
     
     # Add client to room and get peer ID
-    if not await add_client_to_room(room_id, websocket):
+    assigned_id = await add_client_to_room(room_id, websocket)
+    if assigned_id is None:
         try:
             await websocket.send_text(json.dumps({
                 "type": "error",
@@ -488,17 +493,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
         except:
             pass
         return
-    
-    # Find the assigned peer ID for this websocket
-    assigned_id = None
-    if room_id in room_peer_ids:
-        try:
-            client_index = rooms[room_id].index(websocket)
-            if client_index < len(room_peer_ids[room_id]):
-                assigned_id = room_peer_ids[room_id][client_index]
-        except (ValueError, IndexError):
-            log_event(f"❌ Could not find assigned peer ID for websocket in room {room_id}")
-            return
     
     if assigned_id is None:
         log_event(f"❌ Could not determine assigned peer ID for websocket in room {room_id}")
