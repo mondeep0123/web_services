@@ -48,19 +48,22 @@ async def add_client_to_room(room_id: str, websocket: WebSocket) -> bool:
 async def remove_client_from_room(room_id: str, websocket: WebSocket):
     async with room_lock:
         if room_id in rooms and websocket in rooms[room_id]:
-            # Find the websocket index to remove the corresponding peer ID
+            # Find the index of the websocket to remove the corresponding peer ID
             client_index = rooms[room_id].index(websocket)
-            rooms[room_id].remove(websocket)
+            removed_websocket = rooms[room_id].pop(client_index)
             
-            # Remove the corresponding peer ID
+            # Remove the corresponding peer ID at the same index
+            removed_peer_id = None
             if room_id in room_peer_ids and client_index < len(room_peer_ids[room_id]):
-                removed_peer_id = room_peer_ids[room_id][client_index]
-                del room_peer_ids[room_id][client_index]
+                removed_peer_id = room_peer_ids[room_id].pop(client_index)
+            
+            if removed_peer_id is not None:
                 log_event(f"❌ Client (Peer ID {removed_peer_id}) removed from room {room_id} ({len(rooms[room_id])}/4 remaining)")
             else:
                 log_event(f"❌ Client removed from room {room_id} ({len(rooms[room_id])}/4 remaining)")
             
-            if len(rooms[room_id]) == 0:
+            # Check if room is now empty and cleanup if needed
+            if room_id in rooms and len(rooms[room_id]) == 0:
                 if room_id in rooms:
                     del rooms[room_id]
                 if room_id in room_peer_ids:
