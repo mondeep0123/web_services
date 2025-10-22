@@ -549,7 +549,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
         return
     
     # Add client to room and get peer ID
+    log_event(f"🛠️ About to add client to room {room_id}...")
     assigned_id = await add_client_to_room(room_id, websocket)
+    log_event(f"🆔 Peer ID assigned: {assigned_id if assigned_id else 'NONE'}")
     if assigned_id is None:
         try:
             await websocket.send_text(json.dumps({
@@ -560,10 +562,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             await websocket.close()
         except:
             pass
-        return
-    
-    if assigned_id is None:
-        log_event(f"❌ Could not determine assigned peer ID for websocket in room {room_id}")
         return
     
     # Update peer connection state to connected
