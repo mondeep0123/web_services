@@ -538,37 +538,34 @@ async def health_check():
 @app.websocket("/ws/{room_id}/")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
     """WebSocket endpoint for signaling with enhanced error handling."""
-    log_event(f"🔌 Connection attempt for room: {room_id}")
-    
+    assigned_id = None
     try:
+        log_event(f"🔌 Connection attempt for room: {room_id}")
+        
         # Accept WebSocket connection
         await websocket.accept()
         log_event(f"✅ WebSocket accepted for room: {room_id}")
-    except Exception as e:
-        log_event(f"❌ Error accepting WebSocket: {e}")
-        return
-    
-    # Add client to room and get peer ID
-    log_event(f"🛠️ About to add client to room {room_id}...")
-    assigned_id = await add_client_to_room(room_id, websocket)
-    log_event(f"🆔 Peer ID assigned: {assigned_id if assigned_id else 'NONE'}")
-    if assigned_id is None:
-        try:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": "Room is full",
-                "code": "ROOM_FULL"
-            }))
-            await websocket.close()
-        except:
-            pass
-        return
-    
-    # Update peer connection state to connected
-    await update_peer_state(room_id, assigned_id, PEER_STATE_CONNECTED)
-    
-    # Send welcome message with assigned peer ID
-    try:
+        
+        # Add client to room and get peer ID
+        log_event(f"🛠️ About to add client to room {room_id}...")
+        assigned_id = await add_client_to_room(room_id, websocket)
+        log_event(f"🆔 Peer ID assigned: {assigned_id if assigned_id else 'NONE'}")
+        if assigned_id is None:
+            try:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "Room is full",
+                    "code": "ROOM_FULL"
+                }))
+                await websocket.close()
+            except:
+                pass
+            return
+        
+        # Update peer connection state to connected
+        await update_peer_state(room_id, assigned_id, PEER_STATE_CONNECTED)
+        
+        # Send welcome message with assigned peer ID
         welcome_msg = {
             "type": "welcome",
             "peer_id": assigned_id,
@@ -577,11 +574,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
         }
         await websocket.send_text(json.dumps(welcome_msg))
         log_event(f"🎉 Welcome message sent to peer {assigned_id}")
-    except Exception as e:
-        log_event(f"❌ Error sending welcome message: {e}")
-        return
-    
-    try:
+        
+        # Message loop
         while True:
             message = await websocket.receive_text()
             await relay_message(room_id, message, websocket)
@@ -598,9 +592,12 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             }
             await broadcast_to_room(room_id, json.dumps(disconnect_msg), websocket)
     except Exception as e:
-        log_event(f"⚠️ WebSocket error for peer {assigned_id} in room {room_id}: {e}")
+        log_event(f"❌ CRITICAL: Error in websocket_endpoint for room {room_id}, peer {assigned_id}: {e}")
+        import traceback
+        log_event(f"Traceback: {traceback.format_exc()}")
     finally:
-        await remove_client_from_room(room_id, websocket)
+        if assigned_id:
+            await remove_client_from_room(room_id, websocket)
 
 log_event("🚀 Server initialized and ready")
 
