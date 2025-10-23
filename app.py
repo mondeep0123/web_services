@@ -7,14 +7,10 @@ from datetime import datetime
 import json
 import os
 
-import asyncio
-from typing import Dict, List
-from datetime import datetime
-import json
-import os
-
 # Simple signaling server - star topology with host relay
 rooms: Dict[str, List[WebSocket]] = {}
+room_peer_ids: Dict[str, Dict[int, WebSocket]] = {}
+next_peer_id: Dict[str, int] = {}
 room_lock = asyncio.Lock()
 server_start_time = datetime.now()
 connection_log: List[str] = []
@@ -27,51 +23,92 @@ def log_event(message: str):
     if len(connection_log) > 50:
         connection_log.pop(0)
 
-async def add_client_to_room(room_id: str, websocket: WebSocket) -> bool:
-    """Add client to room."""
+async def add_client_to_room(room_id: str, websocket: WebSocket) -> (int, bool):
+    """Add client to room and return peer ID and is_host status."""
     async with room_lock:
+        is_host = False
         if room_id not in rooms:
+            is_host = True
             rooms[room_id] = []
+            room_peer_ids[room_id] = {}
+            next_peer_id[room_id] = 2
         
         if len(rooms[room_id]) >= 4:
             log_event(f"Room {room_id} is full ({len(rooms[room_id])}/4)")
-            return False
+            return None, False
         
+        peer_id = 1 if is_host else next_peer_id[room_id]
+        if not is_host:
+            next_peer_id[room_id] += 1
+        
+        # Notify existing peers
+        if not is_host:
+            msg = json.dumps({"type": "peer_joined", "peer_id": peer_id})
+            for client in rooms[room_id]:
+                try:
+                    await client.send_text(msg)
+                except:
+                    pass
+
         rooms[room_id].append(websocket)
-        log_event(f"✅ Client joined room {room_id} ({len(rooms[room_id])}/4)")
-        return True
+        room_peer_ids[room_id][peer_id] = websocket
+        
+        log_event(f"✅ Peer {peer_id} joined room {room_id} ({len(rooms[room_id])}/4)")
+        return peer_id, is_host
 
 async def remove_client_from_room(room_id: str, websocket: WebSocket):
     """Remove client from room."""
     async with room_lock:
         if room_id in rooms and websocket in rooms[room_id]:
-            rooms[room_id].remove(websocket)
-            log_event(f"❌ Client left room {room_id} ({len(rooms[room_id])}/4)")
+            peer_id_to_remove = None
+            for peer_id, ws in room_peer_ids[room_id].items():
+                if ws == websocket:
+                    peer_id_to_remove = peer_id
+                    break
             
-            # Notify others
-            if rooms[room_id]:
-                msg = json.dumps({"type": "peer_disconnected"})
-                for client in rooms[room_id]:
-                    try:
-                        await client.send_text(msg)
-                    except:
-                        pass
+            if peer_id_to_remove:
+                rooms[room_id].remove(websocket)
+                del room_peer_ids[room_id][peer_id_to_remove]
+                log_event(f"❌ Peer {peer_id_to_remove} left room {room_id} ({len(rooms[room_id])}/4)")
+                
+                # Notify others
+                if rooms[room_id]:
+                    msg = json.dumps({"type": "peer_disconnected", "peer_id": peer_id_to_remove})
+                    for client in rooms[room_id]:
+                        try:
+                            await client.send_text(msg)
+                        except:
+                            pass
             
             # Cleanup empty room
             if not rooms[room_id]:
                 del rooms[room_id]
+                del room_peer_ids[room_id]
+                del next_peer_id[room_id]
                 log_event(f"🧹 Room {room_id} deleted")
 
 async def relay_message(room_id: str, message: str, sender: WebSocket):
     """Relay signaling messages between peers."""
     async with room_lock:
         if room_id in rooms:
-            for client in rooms[room_id]:
-                if client != sender:
+            data = json.loads(message)
+            from_peer_id = data.get("from_peer_id")
+            
+            # In star topology, non-host peers should only talk to host (1)
+            # and host should talk to everyone.
+            if from_peer_id != 1: # Message from a client
+                if 1 in room_peer_ids[room_id]:
                     try:
-                        await client.send_text(message)
+                        await room_peer_ids[room_id][1].send_text(message)
                     except:
                         pass
+            else: # Message from the host
+                for peer_id, client in room_peer_ids[room_id].items():
+                    if client != sender:
+                        try:
+                            await client.send_text(message)
+                        except:
+                            pass
 
 
 # FastAPI app
@@ -154,7 +191,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
         await websocket.accept()
         log_event(f"🔌 Connection to room {room_id}")
         
-        peer_id = await add_client_to_room(room_id, websocket)
+        peer_id, is_host = await add_client_to_room(room_id, websocket)
+        
         if peer_id is None:
             await websocket.send_text(json.dumps({"type": "error", "message": "Room full"}))
             await websocket.close()
@@ -165,13 +203,16 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             "type": "welcome",
             "peer_id": peer_id,
             "room_id": room_id,
-            "is_host": peer_id == 1
+            "is_host": is_host
         }))
-        log_event(f"🎉 Peer {peer_id} welcomed (host={peer_id == 1})")
+        log_event(f"🎉 Peer {peer_id} welcomed (host={is_host})")
         
         # Message loop - relay signaling only
         while True:
             message = await websocket.receive_text()
+            data = json.loads(message)
+            if data.get("type") == "join":
+                continue
             await relay_message(room_id, message, websocket)
     
     except WebSocketDisconnect:
