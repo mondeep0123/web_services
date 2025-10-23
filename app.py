@@ -27,18 +27,23 @@ def log_event(message: str):
 async def add_client_to_room(room_id: str, websocket: WebSocket) -> (int, bool):
     """Add client to room and return peer ID and is_host status."""
     async with room_lock:
+        log_event(f"ADD_CLIENT: Entering for room {room_id}. Current rooms: {list(rooms.keys())}")
         is_host = False
         if room_id not in rooms:
+            log_event(f"ADD_CLIENT: Room {room_id} is new. Creating it.")
             is_host = True
             rooms[room_id] = []
             room_peer_ids[room_id] = {}
             next_peer_id[room_id] = 2
+        else:
+            log_event(f"ADD_CLIENT: Room {room_id} already exists.")
         
         if len(rooms[room_id]) >= 4:
             log_event(f"Room {room_id} is full ({len(rooms[room_id])}/4)")
             return None, False
         
         peer_id = 1 if is_host else next_peer_id[room_id]
+        log_event(f"ADD_CLIENT: is_host={is_host}, assigned peer_id={peer_id}")
         if not is_host:
             next_peer_id[room_id] += 1
         
