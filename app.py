@@ -7,10 +7,14 @@ from datetime import datetime
 import json
 import os
 
+import asyncio
+from typing import Dict, List
+from datetime import datetime
+import json
+import os
+
 # Simple signaling server - star topology with host relay
 rooms: Dict[str, List[WebSocket]] = {}
-room_peer_ids: Dict[str, List[int]] = {}
-next_peer_id: Dict[str, int] = {}
 room_lock = asyncio.Lock()
 server_start_time = datetime.now()
 connection_log: List[str] = []
@@ -23,40 +27,30 @@ def log_event(message: str):
     if len(connection_log) > 50:
         connection_log.pop(0)
 
-async def add_client_to_room(room_id: str, websocket: WebSocket) -> int:
-    """Add client to room and return peer ID (1 for host, 2+ for clients)."""
+async def add_client_to_room(room_id: str, websocket: WebSocket) -> bool:
+    """Add client to room."""
     async with room_lock:
         if room_id not in rooms:
             rooms[room_id] = []
-            room_peer_ids[room_id] = []
-            next_peer_id[room_id] = 1
         
         if len(rooms[room_id]) >= 4:
             log_event(f"Room {room_id} is full ({len(rooms[room_id])}/4)")
-            return None
-        
-        peer_id = next_peer_id[room_id]
-        next_peer_id[room_id] += 1
+            return False
         
         rooms[room_id].append(websocket)
-        room_peer_ids[room_id].append(peer_id)
-        
-        log_event(f"✅ Peer {peer_id} joined room {room_id} ({len(rooms[room_id])}/4)")
-        return peer_id
+        log_event(f"✅ Client joined room {room_id} ({len(rooms[room_id])}/4)")
+        return True
 
 async def remove_client_from_room(room_id: str, websocket: WebSocket):
     """Remove client from room."""
     async with room_lock:
         if room_id in rooms and websocket in rooms[room_id]:
-            idx = rooms[room_id].index(websocket)
-            rooms[room_id].pop(idx)
-            peer_id = room_peer_ids[room_id].pop(idx)
-            
-            log_event(f"❌ Peer {peer_id} left room {room_id} ({len(rooms[room_id])}/4)")
+            rooms[room_id].remove(websocket)
+            log_event(f"❌ Client left room {room_id} ({len(rooms[room_id])}/4)")
             
             # Notify others
             if rooms[room_id]:
-                msg = json.dumps({"type": "peer_disconnected", "peer_id": peer_id})
+                msg = json.dumps({"type": "peer_disconnected"})
                 for client in rooms[room_id]:
                     try:
                         await client.send_text(msg)
@@ -66,38 +60,19 @@ async def remove_client_from_room(room_id: str, websocket: WebSocket):
             # Cleanup empty room
             if not rooms[room_id]:
                 del rooms[room_id]
-                del room_peer_ids[room_id]
-                del next_peer_id[room_id]
                 log_event(f"🧹 Room {room_id} deleted")
 
 async def relay_message(room_id: str, message: str, sender: WebSocket):
     """Relay signaling messages between peers."""
     async with room_lock:
         if room_id in rooms:
-            try:
-                data = json.loads(message)
-                msg_type = data.get("type", "")
-                
-                # Find sender's peer ID
-                sender_id = None
-                if sender in rooms[room_id]:
-                    idx = rooms[room_id].index(sender)
-                    sender_id = room_peer_ids[room_id][idx]
-                
-                # Add sender info
-                data["from_peer_id"] = sender_id
-                message_with_sender = json.dumps(data)
-                
-                # Relay to all others (for signaling)
-                for client in rooms[room_id]:
-                    if client != sender:
-                        try:
-                            await client.send_text(message_with_sender)
-                        except:
-                            pass
-                            
-            except:
-                pass
+            for client in rooms[room_id]:
+                if client != sender:
+                    try:
+                        await client.send_text(message)
+                    except:
+                        pass
+
 
 # FastAPI app
 app = FastAPI()
